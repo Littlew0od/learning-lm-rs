@@ -71,7 +71,33 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 }
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
-    todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
+    let ndim = x.shape().len();
+    assert!(ndim == 2);
+    let seq_len = x.shape()[ndim - 2];
+    let hidden_size = x.shape()[ndim - 1];
+    let data = x.data();
+    let _y = unsafe{ y.data_mut() };
+    for i in 0..seq_len {
+        let offset = hidden_size * i;
+        let tensor = &data[offset..offset + hidden_size];
+        let denominator = (tensor
+        .iter()
+        .fold(0 as f32, |acc, x| acc + x * x) 
+        / hidden_size as f32 
+        + epsilon)
+        .sqrt();
+        let numerator: Vec<f32> = tensor
+        .iter()
+        .zip(w.data().iter())
+        .map(|(a, b)| a * b)
+        .collect();
+
+        _y[offset..offset + hidden_size]
+        .iter_mut()
+        .zip(numerator.iter())
+        .for_each(|(a, b)| *a = b / denominator);
+    }
+    // todo!("实现 rms_norm，计算前做一些必要的检查会帮助你后续调试")
 }
 
 // y = silu(x) * y
@@ -90,6 +116,7 @@ pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
         .zip(sigmoid_x.iter())
         .map(|(a, b)| a * b)
         .collect();
+
     _y
         .iter_mut()
         .zip(silu_x.iter())
