@@ -77,13 +77,25 @@ pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: 
 // y = silu(x) * y
 // hint: this is an element-wise operation
 pub fn swiglu(y: &mut Tensor<f32>, x: &Tensor<f32>) {
-    // let len = y.size();
-    // assert!(len == x.size());
+    let len = y.size();
+    assert!(len == x.size());
 
-    // let _y = unsafe { y.data_mut() };
-    // let _x = x.data();
+    let _y = unsafe { y.data_mut() };
+    let _x = x.data();
+    let sigmoid_x: Vec<f32> = _x.iter()
+        .map(|x| 1 as f32 / (1 as f32 + (-x).exp()))
+        .collect();
+    let silu_x: Vec<f32> = _x
+        .iter()
+        .zip(sigmoid_x.iter())
+        .map(|(a, b)| a * b)
+        .collect();
+    _y
+        .iter_mut()
+        .zip(silu_x.iter())
+        .for_each(|(a, b)| *a *= b );
 
-    todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
+    // todo!("实现 silu，这里给了一些前期准备工作的提示，你可以参考")
 }
 
 // C = beta * C + alpha * A @ B^T
