@@ -2,4 +2,5 @@
 Cargo.lock
 .vscode
 /docs
-/chat
+/models/chat
+modelNames

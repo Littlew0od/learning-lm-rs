@@ -22,14 +22,51 @@ pub struct LLamaParams<T> {
 
 impl LLamaParams<f32> {
     pub fn from_safetensors(safetensor: &SafeTensors, config: &LlamaConfigJson) -> Self {
-        todo!("实现从safetensors文件的模型参数加载");
-        // let get_tensor: impl Fn(&str) -> Tensor<f32> = |name: &str| {
-        // ...    
-        // };
-        
-        // LLamaParams {
-        //     embedding_table: get_tensor(...),
-        //     ...
-        // }
+        // todo!("实现从safetensors文件的模型参数加载");
+        let get_tensor = |name: &str|{
+            let tensor = safetensor.tensor(name).unwrap();
+            let data = tensor.data();
+            let shape = tensor.shape();
+            let mut data_vec = Vec::with_capacity(data.len() / 4);
+
+            for chunk in data.chunks(4) {
+                let bytes: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]]; // 提取 4 个字节
+                data_vec.push(f32::from_le_bytes(bytes));
+            }
+            let shape_vec: Vec<usize> = shape.iter().map(|&x| x ).collect();
+            Tensor::new(data_vec, &shape_vec)
+        };
+        LLamaParams {
+            embedding_table: get_tensor("lm_head.weight"),
+            lm_head: get_tensor("lm_head.weight"),
+            rms_att_w: (0..config.num_hidden_layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.input_layernorm.weight")))
+                .collect(),
+            rms_ffn_w: (0..config.num_hidden_layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.post_attention_layernorm.weight")))
+                .collect(),
+            wq: (0..config.num_hidden_layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.q_proj.weight")))
+                .collect(),
+            wk: (0..config.num_hidden_layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.k_proj.weight")))
+                .collect(),
+            wv: (0..config.num_hidden_layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.v_proj.weight")))
+                .collect(),
+            wo: (0..config.num_hidden_layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.self_attn.o_proj.weight")))
+                .collect(),
+            w_up: (0..config.num_hidden_layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.mlp.up_proj.weight")))
+                .collect(),
+            w_down: (0..config.num_hidden_layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.mlp.down_proj.weight")))
+                .collect(),
+            w_gate: (0..config.num_hidden_layers)
+                .map(|i| get_tensor(&format!("model.layers.{i}.mlp.gate_proj.weight")))
+                .collect(),
+            rms_out_w: get_tensor("model.norm.weight"),
+        }
     }
 }
