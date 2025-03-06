@@ -3,7 +3,7 @@ use std::vec;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
-use crate::operators::{self as OP, matmul_transb, rms_norm, swiglu};
+use crate::operators::{self as OP, masked_softmax, matmul_transb, rms_norm, swiglu};
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
@@ -101,7 +101,9 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            todo!("self_attention(...)");
+            // todo!("self_attention(...)");
+            self_attention(&mut hidden_states, &mut att_scores, q, full_k, full_v,
+                self.n_kv_h, n_groups, seq_len, total_seq_len, self.dqkv);
             todo!("down_proj matmul and add residual");
 
             todo!("mlp(...)");
@@ -134,7 +136,7 @@ impl Llama<f32> {
         temperature: f32,
     ) -> Vec<u32>{
         let mut result = Vec::<u32>::new();
-        
+
         todo!("实现文本生成");
         
         result
@@ -153,7 +155,45 @@ fn self_attention(
     total_seq_len: usize,
     dqkv: usize,
 ) {
-    todo!("Implement self_attention");
+    // todo!("Implement self_attention");
+    let _q = q.data();
+    let _k = k.data();
+    let _v = v.data();
+    let _att_scores = unsafe { att_scores.data_mut() };
+    let _hidden_states = unsafe { hidden_states.data_mut() };
+    for i in 0..n_kv_h {
+        for j in 0..n_groups {
+            let mut score  =att_scores.slice((i * n_groups + j) * seq_len * total_seq_len, 
+                &vec![seq_len, total_seq_len]);
+            let _score = unsafe { score.data_mut() };
+            // 向量乘法
+            for k in 0..seq_len {
+                for l in 0..total_seq_len {
+                    for m in 0..dqkv {
+                        _score[k * total_seq_len + l] += _q[k * n_kv_h * n_groups * dqkv + (i * n_groups + j) * dqkv + m] 
+                            * _k[l * n_kv_h * dqkv + i * dqkv + m];
+                    }
+                }
+            }
+            // 除以sqrt(dim)
+            for i in 0..seq_len {
+                for j in 0..total_seq_len {
+                    _score[i * total_seq_len + j] /= (dqkv as f32).sqrt();
+                }
+            }
+            masked_softmax(&mut score);
+            let _score = unsafe { score.data_mut() };
+            // attn_V(seq * dqkv) = attn(seq * total_seq) @ V(total_seq * dqkv)
+            for k in 0..seq_len {
+                for l in 0..dqkv {
+                    for m in 0..total_seq_len {
+                        _hidden_states[k * n_kv_h * n_groups * dqkv + (i * n_groups + j) * dqkv + l] += _score[k * total_seq_len + l] 
+                            * _v[m * n_kv_h * dqkv + (i * n_groups + j) * dqkv + l];
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn mlp(
