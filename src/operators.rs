@@ -72,9 +72,13 @@ pub fn masked_softmax(y: &mut Tensor<f32>) {
 
 pub fn rms_norm(y: &mut Tensor<f32>, x: &Tensor<f32>, w: &Tensor<f32>, epsilon: f32) {
     let ndim = x.shape().len();
-    assert!(ndim == 2);
-    let seq_len = x.shape()[ndim - 2];
+    let seq_len;
     let hidden_size = x.shape()[ndim - 1];
+    match ndim {
+        1=> { seq_len = 1; },
+        2 => { seq_len = x.shape()[ndim - 2]; },
+        _ => panic!("Unhandled shape!"),
+    }
     let data = x.data();
     let _y = unsafe{ y.data_mut() };
     for i in 0..seq_len {

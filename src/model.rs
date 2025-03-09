@@ -3,7 +3,7 @@ use std::vec;
 
 use crate::config::LlamaConfigJson;
 use crate::kvcache::KVCache;
-use crate::operators::{self as OP, masked_softmax, matmul_transb, rms_norm, swiglu};
+use crate::operators::{self as OP, masked_softmax, matmul_transb, random_sample, rms_norm, swiglu};
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
@@ -104,9 +104,11 @@ impl Llama<f32> {
             // todo!("self_attention(...)");
             self_attention(&mut hidden_states, &mut att_scores, q, full_k, full_v,
                 self.n_kv_h, n_groups, seq_len, total_seq_len, self.dqkv);
-            todo!("down_proj matmul and add residual");
-
-            todo!("mlp(...)");
+            // todo!("down_proj matmul and add residual");
+            OP::matmul_transb(&mut residual, 1., &hidden_states, &self.params.wo[layer], 1.);
+            // todo!("mlp(...)");
+            mlp(&mut residual, &mut hidden_states, &mut gate_buf, &mut up_buf, &self.params.w_up[layer], &self.params.w_down[layer],
+                 &self.params.w_gate[layer], &self.params.rms_ffn_w[layer], self.eps);
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
@@ -136,9 +138,17 @@ impl Llama<f32> {
         temperature: f32,
     ) -> Vec<u32>{
         let mut result = Vec::<u32>::new();
-
-        todo!("实现文本生成");
-        
+        // todo!("实现文本生成");
+        let mut kvcache = self.new_cache();
+        let mut current_token_ids = token_ids.to_vec();
+        for _ in 0..max_len {
+            let shape = current_token_ids.len();
+            let output_ids = self.forward(&Tensor::new(current_token_ids, &vec![shape]), &mut kvcache);
+            let output = random_sample(&output_ids, top_p, top_k, temperature);
+            if output == 2 { break; }
+            result.push(output);
+            current_token_ids = vec![output];
+        }
         result
     }
 }
@@ -187,8 +197,8 @@ fn self_attention(
             for k in 0..seq_len {
                 for l in 0..dqkv {
                     for m in 0..total_seq_len {
-                        _hidden_states[k * n_kv_h * n_groups * dqkv + (i * n_groups + j) * dqkv + l] += _score[k * total_seq_len + l] 
-                            * _v[m * n_kv_h * dqkv + (i * n_groups + j) * dqkv + l];
+                        _hidden_states[k * n_kv_h * n_groups * dqkv + (i * n_groups + j) * dqkv + l] += _score[k * total_seq_len + m] 
+                            * _v[m * n_kv_h * dqkv + i * dqkv + l];
                     }
                 }
             }
