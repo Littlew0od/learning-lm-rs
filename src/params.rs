@@ -37,7 +37,11 @@ impl LLamaParams<f32> {
             Tensor::new(data_vec, &shape_vec)
         };
         LLamaParams {
-            embedding_table: get_tensor("lm_head.weight"),
+            embedding_table: if config.tie_word_embeddings {
+                get_tensor("lm_head.weight")
+            } else {
+                get_tensor("model.embed_tokens.weight")
+            },
             lm_head: get_tensor("lm_head.weight"),
             rms_att_w: (0..config.num_hidden_layers)
                 .map(|i| get_tensor(&format!("model.layers.{i}.input_layernorm.weight")))

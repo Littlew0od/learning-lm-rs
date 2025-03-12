@@ -4,3 +4,4 @@ Cargo.lock
 /docs
 /models/chat
 modelNames
+todoList.md

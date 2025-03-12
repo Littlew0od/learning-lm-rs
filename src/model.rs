@@ -7,6 +7,7 @@ use crate::operators::{self as OP, masked_softmax, matmul_transb, random_sample,
 use crate::params::LLamaParams;
 use crate::tensor::Tensor;
 use safetensors::SafeTensors;
+use tokenizers::Tokenizer;
 use std::path::Path;
 pub struct Llama<T> {
     vocab: usize,           // vocab size
@@ -145,11 +146,48 @@ impl Llama<f32> {
             let shape = current_token_ids.len();
             let output_ids = self.forward(&Tensor::new(current_token_ids, &vec![shape]), &mut kvcache);
             let output = random_sample(&output_ids, top_p, top_k, temperature);
-            if output == 2 { break; }
+            if output == self.eos_token_id { break; }
             result.push(output);
             current_token_ids = vec![output];
         }
         result
+    }
+    
+    pub fn chat_generate(
+        &self,
+        tokenizer: Tokenizer,
+        max_len: usize,
+        top_p: f32,
+        top_k: u32,
+        temperature: f32,
+    ) {
+        let mut kvcache = self.new_cache();
+        loop {
+            println!("User:");
+            let mut result = Vec::<u32>::new();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).unwrap();
+            input.pop();
+            if input == "\\q".to_string() {
+                return;
+            }
+            let render_input = String::from("<|im_start|>system\n<|im_end|>\n<|im_start|>user\n")
+            + &input + "<|im_end|>\n<|im_start|>assistant";
+            // println!("Input: {render_input}");
+            let binding = tokenizer.encode(render_input, true).unwrap();
+            let input_ids = binding.get_ids();
+            let mut current_token_ids = input_ids.to_vec();
+            // one time generate
+            for _ in 0..max_len {
+                let shape = current_token_ids.len();
+                let output_ids = self.forward(&Tensor::new(current_token_ids, &vec![shape]), &mut kvcache);
+                let output = random_sample(&output_ids, top_p, top_k, temperature);
+                if output == self.eos_token_id { break; }
+                result.push(output);
+                current_token_ids = vec![output];
+            }
+            println!("AI: {}", tokenizer.decode(&result, true).unwrap());
+        }
     }
 }
 
@@ -169,7 +207,6 @@ fn self_attention(
     let _q = q.data();
     let _k = k.data();
     let _v = v.data();
-    let _att_scores = unsafe { att_scores.data_mut() };
     let _hidden_states = unsafe { hidden_states.data_mut() };
     for i in 0..n_kv_h {
         for j in 0..n_groups {
@@ -179,10 +216,12 @@ fn self_attention(
             // 向量乘法
             for k in 0..seq_len {
                 for l in 0..total_seq_len {
+                    let mut sum = 0.;
                     for m in 0..dqkv {
-                        _score[k * total_seq_len + l] += _q[k * n_kv_h * n_groups * dqkv + (i * n_groups + j) * dqkv + m] 
+                        sum += _q[k * n_kv_h * n_groups * dqkv + (i * n_groups + j) * dqkv + m] 
                             * _k[l * n_kv_h * dqkv + i * dqkv + m];
                     }
+                    _score[k * total_seq_len + l] = sum;
                 }
             }
             // 除以sqrt(dim)
@@ -196,10 +235,12 @@ fn self_attention(
             // attn_V(seq * dqkv) = attn(seq * total_seq) @ V(total_seq * dqkv)
             for k in 0..seq_len {
                 for l in 0..dqkv {
+                    let mut sum = 0.;
                     for m in 0..total_seq_len {
-                        _hidden_states[k * n_kv_h * n_groups * dqkv + (i * n_groups + j) * dqkv + l] += _score[k * total_seq_len + m] 
+                         sum += _score[k * total_seq_len + m] 
                             * _v[m * n_kv_h * dqkv + i * dqkv + l];
                     }
+                    _hidden_states[k * n_kv_h * n_groups * dqkv + (i * n_groups + j) * dqkv + l] = sum;
                 }
             }
         }
