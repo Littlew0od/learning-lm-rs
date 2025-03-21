@@ -1,7 +1,12 @@
+use std::ops::Mul;
+use half::f16;
 use crate::tensor::Tensor;
 
 // get (row) vectors from a 2D table given a list of indices
-pub fn gather(y: &mut Tensor<f32>, indices: &Tensor<u32>, table: &Tensor<f32>) {
+pub fn gather<T>(y: &mut Tensor<T>, indices: &Tensor<u32>, table: &Tensor<T>) 
+where
+    T: Clone, T: Default, T: std::marker::Copy, T: Mul<Output = T>,
+{
     let length = indices.size();
     let table_shape = table.shape();
     assert!(table_shape.len() == 2);
@@ -150,6 +155,28 @@ pub fn matmul_transb(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f32>, b: &Tensor
         }
     }
     // todo!("实现 matmul_transb，计算前做一些必要的检查会帮助你后续调试");
+}
+
+// C = beta * C + alpha * A @ B^T
+// hint: You don't need to do an explicit transpose of B
+pub fn matmul_transb_f16(c: &mut Tensor<f32>, beta: f32, a: &Tensor<f16>, b: &Tensor<f16>, alpha: f32) {
+    let a_shape = a.shape();
+    let b_shape = b.shape();
+    let hidden_size = a_shape[1];
+    assert_eq!(a_shape[1], b_shape[1]);
+    let _a = a.data();
+    let _b = b.data();
+    let _c = unsafe { c.data_mut() };
+    let boundary = b_shape[0];
+    for i in 0..a_shape[0] {
+        for j in 0..b_shape[0] {
+            let mut sum = 0.0 as f32;
+            for k in 0..a_shape[1] {
+                sum += (_a[i * hidden_size + k] * _b[j * hidden_size + k]).to_f32();
+            }
+            _c[i * boundary + j] = beta * _c[i * boundary + j] + alpha * sum;
+        }
+    }
 }
 
 // Dot product of two tensors (treated as vectors)

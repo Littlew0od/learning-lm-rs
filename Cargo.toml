@@ -9,8 +9,10 @@ serde_json = "1.0"
 safetensors = "0.4.3"
 tokenizers = "0.19.1"
 rand = "0.8"
+half = "2.5.0"
 
 [features]
-default = ["chat"]
+default = ["chat", "fp16"]
 chat = []
 story = []
+fp16 = []

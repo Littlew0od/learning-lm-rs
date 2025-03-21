@@ -7,6 +7,7 @@ mod tensor;
 
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
+use half::f16;
 
 fn main() {
     let project_dir = env!("CARGO_MANIFEST_DIR");
@@ -14,6 +15,9 @@ fn main() {
     let model_dir = PathBuf::from(project_dir).join("models").join("story");
     #[cfg(feature = "chat")]
     let model_dir = PathBuf::from(project_dir).join("models").join("chat");
+    #[cfg(feature = "fp16")]
+    let llama = model::Llama::<f16>::from_safetensors(&model_dir);
+    #[cfg(not(feature = "fp16"))]
     let llama = model::Llama::<f32>::from_safetensors(&model_dir);
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
     #[cfg(feature = "story")] {

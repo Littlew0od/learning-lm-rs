@@ -1,4 +1,5 @@
 use std::{slice, sync::Arc, vec};
+use half::f16;
 pub struct Tensor<T> {
     data: Arc<Box<[T]>>,
     shape: Vec<usize>,
@@ -61,12 +62,17 @@ impl<T: Copy + Clone + Default> Tensor<T> {
             length: new_length,
         }
     }
-
-
 }
 
 // Some helper functions for testing and debugging
 impl Tensor<f32> {
+    pub fn trans_tensor(&self, target: &mut Tensor<f16>){
+        let _data = self.data();
+        let _mut_data = unsafe { target.data_mut() };
+        _data.iter()
+            .zip(_mut_data.iter_mut())
+            .for_each(|(&x, y)| *y = f16::from_f32(x));
+    }
     #[allow(unused)]
     pub fn close_to(&self, other: &Self, rel: f32) -> bool {
         if self.shape() != other.shape() {
