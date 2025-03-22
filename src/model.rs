@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::sync::Arc;
 use std::vec;
 
 use crate::config::LlamaConfigJson;
@@ -9,6 +10,8 @@ use crate::tensor::Tensor;
 use safetensors::SafeTensors;
 use tokenizers::Tokenizer;
 use std::path::Path;
+use std::thread;
+use num_cpus;
 pub struct Llama<T> {
     vocab: usize,           // vocab size
     n_layers: usize,        // number of layers
@@ -65,8 +68,8 @@ impl Llama<f32> {
         let mut residual = Tensor::<f32>::default(&vec![seq_len, self.d]);
         let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, self.d]);
         let mut q_buf = Tensor::<f32>::default(&vec![seq_len, self.n_q_h * self.dqkv]);
-        let mut att_scores =
-            Tensor::<f32>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
+        // let mut att_scores =
+        //     Tensor::<f32>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
         let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
         let mut up_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
 
@@ -102,14 +105,22 @@ impl Llama<f32> {
             let full_k = &mut cache.k_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
             let full_v = &mut cache.v_cache(layer, 0); // (total_seq, n_kv_h * dqkv)
 
-            // todo!("self_attention(...)");
+            #[cfg(feature = "distributed")]
+            self_attention_distributed(&mut residual, &mut hidden_states, q, full_k, full_v, &self.params.wo[layer],
+                self.n_kv_h, n_groups, seq_len, total_seq_len, self.dqkv, self.d);
+            #[cfg(not(feature = "distributed"))]
             self_attention(&mut hidden_states, &mut att_scores, q, full_k, full_v,
                 self.n_kv_h, n_groups, seq_len, total_seq_len, self.dqkv);
-            // todo!("down_proj matmul and add residual");
+            
+            #[cfg(not(feature = "distributed"))]
             OP::matmul_transb(&mut residual, 1., &hidden_states, &self.params.wo[layer], 1.);
-            // todo!("mlp(...)");
-            mlp(&mut residual, &mut hidden_states, &mut gate_buf, &mut up_buf, &self.params.w_up[layer], &self.params.w_down[layer],
+            
+            #[cfg(feature = "distributed")]
+            mlp_distributed(&mut residual, &mut hidden_states, &mut gate_buf, &mut up_buf, &self.params.w_up[layer], &self.params.w_down[layer],
                  &self.params.w_gate[layer], &self.params.rms_ffn_w[layer], self.eps);
+            #[cfg(not(feature = "distributed"))]
+            mlp(&mut residual, &mut hidden_states, &mut gate_buf, &mut up_buf, &self.params.w_up[layer], &self.params.w_down[layer],
+                &self.params.w_gate[layer], &self.params.rms_ffn_w[layer], self.eps);
         }
 
         // No matter what seq_len, the output is always a 1D vector of length vocab,
@@ -247,7 +258,185 @@ fn self_attention(
     }
 }
 
+fn self_attention_distributed(
+    residual: &mut Tensor<f32>,
+    hidden_states: &mut Tensor<f32>, // (seq, n_kv_h * n_groups * dqkv)
+    // att_scores: &mut Tensor<f32>,    // (n_kv_h, n_groups, seq, total_seq)
+    q: &Tensor<f32>,                 // (seq, n_kv_h * n_groups * dqkv)
+    k: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
+    v: &Tensor<f32>,                 // (total_seq, n_kv_h * dqkv)
+    wo: &Tensor<f32>,
+    n_kv_h: usize,
+    n_groups: usize,
+    seq_len: usize,
+    total_seq_len: usize,
+    dqkv: usize,
+    d: usize,
+) {
+    if n_kv_h * n_groups != num_cpus::get() {
+        // eprintln!("Warning: Here we assume that the number of CPU cores is equal to the number of heads, but currently they are not equal.");
+    }
+    let _q = Arc::new(q.clone());
+    let _k = Arc::new(k.clone());
+    let _v = Arc::new(v.clone());
+    let _wo = Arc::new(wo.clone());
+    let thread_count = n_kv_h * n_groups;
+    let handles: Vec<_> = (1..thread_count).map(|i| {
+        let __q = _q.clone();
+        let __k = _k.clone();
+        let __v = _v.clone();
+        let __wo = _wo.clone();
+
+        thread::spawn(move || {
+            let ___q = __q.data();
+            let ___k = __k.data();
+            let ___v = __v.data();
+            let ___wo = __wo.data();
+
+            let mut score: Tensor<f32> = Tensor::default(&vec![seq_len, total_seq_len]);
+            let _score = unsafe { score.data_mut() };
+            let mut residual = Tensor::<f32>::default(&vec![seq_len, d]);
+            let _residual = unsafe { residual.data_mut() };
+            let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, d]);
+            let _hidden_states = unsafe { hidden_states.data_mut() };
+            let kv_index = i / n_groups;
+            let n_group = i % n_groups;
+
+            for k in 0..seq_len {
+                for l in 0..total_seq_len {
+                    let mut sum = 0.;
+                    for m in 0..dqkv {
+                        sum += ___q[k * n_kv_h * n_groups * dqkv + (kv_index * n_groups + n_group) * dqkv + m] 
+                            * ___k[l * n_kv_h * dqkv + kv_index * dqkv + m];
+                    }
+                    _score[k * total_seq_len + l] = sum;
+                }
+            }
+            // 除以sqrt(dim)
+            for m in 0..seq_len {
+                for n in 0..total_seq_len {
+                    _score[m * total_seq_len + n] /= (dqkv as f32).sqrt();
+                }
+            }
+            masked_softmax(&mut score);
+
+            let _score = unsafe { score.data_mut() };
+            // attn_V(seq * dqkv) = attn(seq * total_seq) @ V(total_seq * dqkv)
+            for k in 0..seq_len {
+                for l in 0..dqkv {
+                    let mut sum = 0.;
+                    for m in 0..total_seq_len {
+                         sum += _score[k * total_seq_len + m] 
+                            * ___v[m * n_kv_h * dqkv + kv_index * dqkv + l];
+                    }
+                    _hidden_states[k * n_kv_h * n_groups * dqkv + i * dqkv + l] = sum;
+                }
+            }
+
+            // residual(seq * hidden_size) = attn_V(seq * dqkv) @ wo(dqkv * hidden_size)
+            for m in 0..seq_len {
+                for n in 0..d {
+                    let mut sum = 0.0;
+                    for o in 0..dqkv {
+                        sum += _hidden_states[m * n_kv_h * n_groups * dqkv + i * dqkv + o] 
+                            * ___wo[n * n_kv_h * n_groups * dqkv + i * dqkv + o];
+                    }
+                    _residual[m * d + n] = sum;
+                }
+            }
+            residual
+        })
+    }).collect();
+
+    let __q = _q.data();
+    let __k = _k.data();
+    let __v = _v.data();
+    let __wo = _wo.data();
+
+    let mut score: Tensor<f32> = Tensor::default(&vec![seq_len, total_seq_len]);
+    let _score = unsafe { score.data_mut() };
+
+    for k in 0..seq_len {
+        for l in 0..total_seq_len {
+            let mut sum = 0.;
+            for m in 0..dqkv {
+                sum += __q[k * n_kv_h * n_groups * dqkv + m] 
+                    * __k[l * n_kv_h * dqkv + m];
+            }
+            _score[k * total_seq_len + l] = sum;
+        }
+    }
+    // 除以sqrt(dim)
+    for m in 0..seq_len {
+        for n in 0..total_seq_len {
+            _score[m * total_seq_len + n] /= (dqkv as f32).sqrt();
+        }
+    }
+    masked_softmax(&mut score);
+
+    let _score = unsafe { score.data_mut() };
+    let _hidden_states = unsafe { hidden_states.data_mut() };
+    // attn_V(seq * dqkv) = attn(seq * total_seq) @ V(total_seq * dqkv)
+    for k in 0..seq_len {
+        for l in 0..dqkv {
+            let mut sum = 0.;
+            for m in 0..total_seq_len {
+                 sum += _score[k * total_seq_len + m] 
+                    * __v[m * n_kv_h * dqkv + l];
+            }
+            _hidden_states[k * n_kv_h * n_groups * dqkv + l] = sum;
+        }
+    }
+
+    // residual(seq * hidden_size) = attn_V(seq * dqkv) @ wo(dqkv * hidden_size)
+    let _residual = unsafe { residual.data_mut() };
+    for m in 0..seq_len {
+        for n in 0..d {
+            let mut sum = 0.0;
+            for o in 0..dqkv {
+                sum += _hidden_states[m * n_kv_h * n_groups * dqkv + o] 
+                    * __wo[n * n_kv_h * n_groups * dqkv + o];
+            }
+            _residual[m * d + n] += sum;
+        }
+    }
+    for (_, handle) in handles.into_iter().enumerate() {
+        let distributed_residual = handle.join().unwrap();
+        residual.all_reduce(distributed_residual);
+    }
+}
+
 fn mlp(
+    residual: &mut Tensor<f32>,
+    hidden_states: &mut Tensor<f32>,
+    gate: &mut Tensor<f32>,
+    up: &mut Tensor<f32>,
+    w_up: &Tensor<f32>,
+    w_down: &Tensor<f32>,
+    w_gate: &Tensor<f32>,
+    rms_w: &Tensor<f32>,
+    eps: f32,
+) {
+    // hidden = rms_norm(residual)
+    rms_norm(hidden_states, residual, rms_w, eps);
+
+    // gate = hidden @ gate_weight.T
+    matmul_transb(gate, 0., hidden_states, w_gate, 1.);
+
+    // up = hidden @ up_weight.T
+    matmul_transb(up, 0., hidden_states, w_up, 1.);
+
+    // act = gate * sigmoid(gate) * up ## SwiGLU
+    swiglu(up, gate);
+
+    // output = act @ down_weight.T
+    // residual = output + residual
+    matmul_transb(residual, 1., up, w_down, 1.);
+    
+    // todo!("Implement mlp");
+}
+
+fn mlp_distributed(
     residual: &mut Tensor<f32>,
     hidden_states: &mut Tensor<f32>,
     gate: &mut Tensor<f32>,

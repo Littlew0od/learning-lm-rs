@@ -1,4 +1,5 @@
 use std::{slice, sync::Arc, vec};
+#[derive(Clone)]
 pub struct Tensor<T> {
     data: Arc<Box<[T]>>,
     shape: Vec<usize>,
@@ -67,6 +68,12 @@ impl<T: Copy + Clone + Default> Tensor<T> {
 
 // Some helper functions for testing and debugging
 impl Tensor<f32> {
+    pub fn all_reduce(&mut self, tensor: Tensor<f32>) {
+        assert!(self.shape() == tensor.shape());
+        let _self = unsafe { self.data_mut() };
+        let _tensor = tensor.data();
+        _self.iter_mut().zip(_tensor.iter()).for_each(|(a, b)| { *a += b; });
+    }
     #[allow(unused)]
     pub fn close_to(&self, other: &Self, rel: f32) -> bool {
         if self.shape() != other.shape() {
