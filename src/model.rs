@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::sync::Arc;
+use std::time::Instant;
 use std::vec;
 
 use crate::config::LlamaConfigJson;
@@ -68,8 +69,9 @@ impl Llama<f32> {
         let mut residual = Tensor::<f32>::default(&vec![seq_len, self.d]);
         let mut hidden_states = Tensor::<f32>::default(&vec![seq_len, self.d]);
         let mut q_buf = Tensor::<f32>::default(&vec![seq_len, self.n_q_h * self.dqkv]);
-        // let mut att_scores =
-        //     Tensor::<f32>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
+        #[cfg(not(feature = "distributed"))]
+        let mut att_scores =
+            Tensor::<f32>::default(&vec![self.n_kv_h, n_groups, seq_len, total_seq_len]);
         let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
         let mut up_buf = Tensor::<f32>::default(&vec![seq_len, self.di]);
 
@@ -117,7 +119,7 @@ impl Llama<f32> {
             
             #[cfg(feature = "distributed")]
             mlp_distributed(&mut residual, &mut hidden_states, &mut gate_buf, &mut up_buf, &self.params.w_up[layer], &self.params.w_down[layer],
-                 &self.params.w_gate[layer], &self.params.rms_ffn_w[layer], self.eps);
+                 &self.params.w_gate[layer], &self.params.rms_ffn_w[layer], self.eps, self.di, seq_len, self.d);
             #[cfg(not(feature = "distributed"))]
             mlp(&mut residual, &mut hidden_states, &mut gate_buf, &mut up_buf, &self.params.w_up[layer], &self.params.w_down[layer],
                 &self.params.w_gate[layer], &self.params.rms_ffn_w[layer], self.eps);
@@ -182,6 +184,7 @@ impl Llama<f32> {
             if input == "\\q".to_string() {
                 return;
             }
+            let start = Instant::now();
             let render_input = String::from("<|im_start|>system\n<|im_end|>\n<|im_start|>user\n")
             + &input + "<|im_end|>\n<|im_start|>assistant";
             // println!("Input: {render_input}");
@@ -198,6 +201,8 @@ impl Llama<f32> {
                 current_token_ids = vec![output];
             }
             println!("AI: {}", tokenizer.decode(&result, true).unwrap());
+            let duration = start.elapsed();
+            println!("Time elapsed is: {:?}", duration);
         }
     }
 }
@@ -446,24 +451,90 @@ fn mlp_distributed(
     w_gate: &Tensor<f32>,
     rms_w: &Tensor<f32>,
     eps: f32,
+    di: usize,
+    seq_len: usize,
+    d: usize,
 ) {
     // hidden = rms_norm(residual)
     rms_norm(hidden_states, residual, rms_w, eps);
 
-    // gate = hidden @ gate_weight.T
-    matmul_transb(gate, 0., hidden_states, w_gate, 1.);
+    let thread_count = num_cpus::get();
+    assert!(di % thread_count == 0);
+
+    let _hidden_states = Arc::new(hidden_states.clone());
+    let _w_gate = Arc::new(w_gate.clone());
+    let _w_up = Arc::new(w_up.clone());
+    let _w_down = Arc::new(w_down.clone());
+
+    let handles: Vec<_> = (1..thread_count).map(|i| {
+        let __hidden_states = _hidden_states.clone();
+        let __w_gate = _w_gate.slice(di / thread_count * d * i, &vec![di / thread_count, d]);
+        let __w_up = _w_up.slice(di / thread_count * d * i, &vec![di / thread_count, d]);
+        let __w_down = _w_down.clone();
+        thread::spawn(move|| {
+            let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, di / thread_count]);
+            let mut up_buf = Tensor::<f32>::default(&vec![seq_len, di / thread_count]);
+            // gate = hidden @ gate_weight.T
+            matmul_transb(&mut gate_buf, 0., &__hidden_states, &__w_gate, 1.);
+
+            // up = hidden @ up_weight.T
+            matmul_transb(&mut up_buf, 0., &__hidden_states, &__w_up, 1.);
+
+            // act = gate * sigmoid(gate) * up ## SwiGLU
+            swiglu(&mut up_buf, &gate_buf);
+
+            // output = act @ down_weight.T
+            let mut residual: Tensor<f32> = Tensor::default(&vec![seq_len, d]);
+            let _residual = unsafe { residual.data_mut() };
+            let _up_buf = up_buf.data();
+            let ___w_down = __w_down.data();
+            for m in 0..seq_len {
+                for n in 0..d {
+                    let mut sum = 0.0 as f32;
+                    for o in 0..di / thread_count {
+                        sum += _up_buf[m * di / thread_count + o] 
+                            * ___w_down[n * di + i * di / thread_count + o];
+                    }
+                    _residual[m * d + n] = sum;
+                }
+            }
+            residual
+        })
+    }).collect();
+
+    let mut gate_buf = Tensor::<f32>::default(&vec![seq_len, di / thread_count]);
+    let mut up_buf = Tensor::<f32>::default(&vec![seq_len, di / thread_count]);
+
+    let __w_gate = _w_gate.slice(0, &vec![di / thread_count, d]);
+    let __w_up = _w_up.slice(0, &vec![di / thread_count, d]);
+
+    matmul_transb(&mut gate_buf, 0., hidden_states, &__w_gate, 1.);
 
     // up = hidden @ up_weight.T
-    matmul_transb(up, 0., hidden_states, w_up, 1.);
+    matmul_transb(&mut up_buf, 0., hidden_states, &__w_up, 1.);
 
     // act = gate * sigmoid(gate) * up ## SwiGLU
-    swiglu(up, gate);
+    swiglu(&mut up_buf, &gate_buf);
 
     // output = act @ down_weight.T
+    let _residual = unsafe { residual.data_mut() };
+    let _up_buf = up_buf.data();
+    let ___w_down = w_down.data();
+    for m in 0..seq_len {
+        for n in 0..d {
+            let mut sum = 0.0 as f32;
+            for o in 0..di / thread_count {
+                sum += _up_buf[m * di / thread_count + o] 
+                    * ___w_down[n * di + o];
+            }
+            _residual[m * d + n] += sum;
+        }
+    }
     // residual = output + residual
-    matmul_transb(residual, 1., up, w_down, 1.);
-    
-    // todo!("Implement mlp");
+    for (_, handle) in handles.into_iter().enumerate() {
+        let distributed_residual = handle.join().unwrap();
+        residual.all_reduce(distributed_residual);
+    }
 }
 
 #[test]
